@@ -7,6 +7,6 @@ class Config(BaseModel):
     naga_api_host: str = "127.0.0.1"
     naga_api_port: int = 8000
     
-    # HANDOFF 循环配置
+    # HANDOFF 工具调用循环配置
     max_handoff_loop: int = 5
     show_handoff: bool = False

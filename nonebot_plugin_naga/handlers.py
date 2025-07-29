@@ -3,6 +3,7 @@ from nonebot.adapters import Bot, Event
 from nonebot.typing import T_State
 from nonebot.rule import Rule
 import json
+import asyncio
 
 from .api_client import NagaAgentClient
 from .utils import parse_handoff_content
@@ -14,10 +15,51 @@ naga_client = NagaAgentClient()
 # 存储用户自定义前缀的字典 {user_id: prefix}
 user_prefixes = {}
 
+import random
+import time
+
+# 存储用户会话信息的字典 {user_id: {session_name: session_id, ...}}
+user_sessions = {}
+
+# 存储用户当前活跃会话名的字典 {user_id: active_session_name}
+active_sessions = {}
+
+# 已生成的会话ID集合，确保唯一性
+generated_session_ids = set()
+
+# 生成唯一的6位数字会话ID
+def generate_session_id() -> str:
+    """生成唯一的6位数字会话ID"""
+    max_attempts = 100  # 最大尝试次数，防止无限循环
+    for _ in range(max_attempts):
+        # 使用时间戳和随机数生成唯一ID
+        timestamp = int(time.time()) % 1000000  # 取时间戳后6位
+        random_num = random.randint(0, 999999)  # 6位随机数
+        # 组合生成6位数字ID
+        session_id = (timestamp + random_num) % 1000000
+        session_id_str = f"{session_id:06d}"  # 格式化为6位数字，不足的前面补0
+        
+        # 检查ID是否唯一
+        if session_id_str not in generated_session_ids:
+            generated_session_ids.add(session_id_str)
+            return session_id_str
+    
+    # 如果尝试次数过多，使用随机生成
+    while True:
+        session_id_str = f"{random.randint(0, 999999):06d}"
+        if session_id_str not in generated_session_ids:
+            generated_session_ids.add(session_id_str)
+            return session_id_str
+
+# API服务器健康状态
+api_healthy = None
+# 健康检查是否已经执行过
+health_check_done = False
+
 # 定义规则：消息以 #naga 开头或者匹配用户自定义前缀
 async def message_match_naga(bot: Bot, event: Event, state: T_State) -> bool:
     """检查消息是否以 #naga 开头或者匹配用户自定义前缀"""
-    # 检查是否是支持的消息事件类型
+    # 棣检查是否是支持的消息事件类型
     plain_text = ""
     user_id = None
     
@@ -69,10 +111,171 @@ naga_handler = on_message(
 
 logger.info("Naga处理器已注册，支持所有适配器")
 
+# 插件启动时检查API服务器状态
+async def check_api_health():
+    """检查API服务器健康状态"""
+    global api_healthy, health_check_done
+    if not health_check_done:  # 只执行一次健康检查
+        api_healthy = await naga_client.health_check()
+        health_check_done = True
+        if api_healthy:
+            logger.success("NagaAgent API服务器连接正常")
+        else:
+            logger.error("NagaAgent API服务器未响应，请检查服务器是否启动")
+
+# 我们不能直接在这里创建任务，因为此时可能还没有运行的事件循环
+# 改为在第一次实际使用时检查健康状态
+
+
+async def handle_session_commands(user_id: str, command: str, handler) -> None:
+    """处理会话管理命令"""
+    logger.debug(f"用户 {user_id} 请求会话管理命令: {command}")
+    
+    # 初始化用户会话字典
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {}
+    
+    # 初始化用户活跃会话
+    if user_id not in active_sessions:
+        active_sessions[user_id] = None  # 没有活跃会话
+    
+    # 分析命令
+    if command == "list":
+        # 列出所有会话
+        sessions = user_sessions.get(user_id, {})
+        active_session = active_sessions.get(user_id)
+        
+        # 如果没有任何会话，显示提示信息
+        if not sessions:
+            await handler.finish("""📋 会话列表:\n  ❗ 暂无会话\n\n💡 提示：\n • 发送任意消息即可自动创建默认会话\n • 使用 '#naga session create <名称>' 创建新会话""")
+            return
+        
+        session_list = "📋 会话列表:\n"
+        for name, session_id in sessions.items():
+            marker = "🔹" if name == active_session else "  "
+            active_marker = " ← 当前激活" if name == active_session else ""
+            session_list += f"{marker} {name}: {session_id or '未激活'}{active_marker}\n"
+        await handler.finish(session_list.rstrip())
+    
+    elif command == "clear":
+        # 清空所有会话
+        user_sessions[user_id] = {}
+        active_sessions[user_id] = None
+        await handler.finish("✅ 已清空所有会话")
+    
+    elif command.startswith("switch "):
+        # 切换会话
+        session_name = command[7:].strip()  # 7是"switch "的长度
+        if not session_name:
+            await handler.finish("❌ 请提供会话名称")
+        
+        sessions = user_sessions.get(user_id, {})
+        if session_name not in sessions:
+            await handler.finish(f"❌ 会话 '{session_name}' 不存在")
+        
+        active_sessions[user_id] = session_name
+        await handler.finish(f"✅ 已切换到会话 '{session_name}'")
+    
+    elif command.startswith("create "):
+        # 创建新会话
+        session_name = command[7:].strip()  # 7是"create "的长度
+        if not session_name:
+            await handler.finish("❌ 请提供会话名称")
+        
+        sessions = user_sessions.get(user_id, {})
+        if session_name in sessions:
+            await handler.finish(f"❌ 会话 '{session_name}' 已存在")
+        
+        # 创建新会话（初始ID为None，将在首次使用时由API分配）
+        sessions[session_name] = None
+        user_sessions[user_id] = sessions
+        
+        # 自动激活新创建的会话
+        active_sessions[user_id] = session_name
+        await handler.finish(f"✅ 已创建并激活会话 '{session_name}'")
+    
+    elif command.startswith("delete "):
+        # 删除会话
+        session_name = command[7:].strip()  # 7是"delete "的长度
+        if not session_name:
+            await handler.finish("❌ 请提供会话名称")
+        
+        sessions = user_sessions.get(user_id, {})
+        if session_name not in sessions:
+            await handler.finish(f"❌ 会话 '{session_name}' 不存在")
+        
+        # 删除会话
+        del sessions[session_name]
+        user_sessions[user_id] = sessions
+        
+        # 如果删除的是当前活跃会话，清除活跃会话
+        if active_sessions.get(user_id) == session_name:
+            active_sessions[user_id] = None
+        
+        await handler.finish(f"✅ 已删除会话 '{session_name}'")
+    
+    elif command.startswith("rename "):
+        # 重命名会话
+        parts = command[7:].strip().split(" ", 1)  # 7是"rename "的长度
+        if len(parts) != 2:
+            await handler.finish("❌ 命令格式错误，请使用: session rename <旧名称> <新名称>")
+        
+        old_name, new_name = parts
+        if not old_name or not new_name:
+            await handler.finish("❌ 请提供旧会话名称和新会话名称")
+        
+        sessions = user_sessions.get(user_id, {})
+        if old_name not in sessions:
+            await handler.finish(f"❌ 会话 '{old_name}' 不存在")
+        
+        if new_name in sessions:
+            await handler.finish(f"❌ 会话 '{new_name}' 已存在")
+        
+        # 重命名会话
+        session_id = sessions.pop(old_name)
+        sessions[new_name] = session_id
+        user_sessions[user_id] = sessions
+        
+        # 如果重命名的是当前活跃会话，更新活跃会话名
+        if active_sessions.get(user_id) == old_name:
+            active_sessions[user_id] = new_name
+        
+        await handler.finish(f"✅ 已将会话 '{old_name}' 重命名为 '{new_name}'")
+    
+    elif command == "info":
+        # 显示当前会话信息
+        active_session = active_sessions.get(user_id)
+        sessions = user_sessions.get(user_id, {})
+        session_id = sessions.get(active_session) if active_session else None
+        
+        info_text = "📊 当前会话信息:\n"
+        if active_session:
+            info_text += f"  活跃会话: {active_session}\n"
+            info_text += f"  会话ID: {session_id or '未分配'}\n"
+        else:
+            info_text += "  活跃会话: 无\n"
+        info_text += f"  总会话数: {len(sessions)}"
+        await handler.finish(info_text)
+    
+    else:
+        # 显示帮助信息
+        help_text = """📋 会话管理命令:
+#naga session list - 列出所有会话
+#naga session switch <名称> - 切换到指定会话
+#naga session create <名称> - 创建新会话
+#naga session delete <名称> - 删除指定会话
+#naga session rename <旧名称> <新名称> - 重命名会话
+#naga session clear - 清空所有会话
+#naga session info - 显示当前会话信息
+#naga session - 显示此帮助信息"""
+        await handler.finish(help_text)
+
 
 @naga_handler.handle()
 async def handle_naga_command(bot: Bot, event: Event, state: T_State):
     """处理以 #naga 开头或匹配自定义前缀的命令"""
+    global api_healthy
+    
     # 获取用户消息
     plain_text = ""
     user_id = None
@@ -82,6 +285,7 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
         plain_text = event.get_plaintext().strip()
     elif hasattr(event, 'get_message'):
         try:
+
             message = event.get_message()
             if hasattr(message, 'extract_plain_text'):
                 plain_text = message.extract_plain_text().strip()
@@ -96,6 +300,17 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
     else:
         # 如果无法获取用户ID，使用事件类型和ID组合作为标识符
         user_id = f"{event.__class__.__name__}_{getattr(event, 'event_id', 'unknown')}"
+    
+    # 为用户ID添加平台标识以避免不同平台间的会话混淆
+    if hasattr(event, 'adapter'):
+        adapter_name = event.adapter.get_name()
+        user_id = f"{adapter_name}_{user_id}"
+    elif hasattr(bot, 'adapter') and hasattr(bot.adapter, 'get_name'):
+        adapter_name = bot.adapter.get_name()
+        user_id = f"{adapter_name}_{user_id}"
+    
+    # 记录用户ID和消息内容以便调试
+    logger.debug(f"获取到用户ID: {user_id}, 消息内容: '{plain_text}'")
     
     if not plain_text or not user_id:
         logger.warning("无法从事件中提取消息文本或用户ID")
@@ -121,7 +336,25 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
     
     if not user_message:
         # 如果没有消息内容，显示帮助信息
-        await naga_handler.finish("用法:\n#naga [消息] - 发送消息给AI\n#naga activate [前缀] - 设置自定义激活前缀")
+        help_text = """🤖 NagaAgent AI助手使用说明:
+#naga [消息] - 发送消息给AI
+#naga activate [前缀] - 设置自定义激活前缀
+
+🔧 会话管理命令:
+#naga session list - 列出所有会话
+#naga session switch <名称> - 切换到指定会话
+#naga session create <名称> - 创建新会话
+#naga session delete <名称> - 删除指定会话
+#naga session rename <旧名称> <新名称> - 重命名会话
+#naga session clear - 清空所有会话
+#naga session info - 显示当前会话信息
+#naga session - 显示此帮助信息
+
+⚙️ 系统管理命令:
+#naga devmode on - 启用开发者模式
+#naga devmode off - 禁用开发者模式
+#naga sysinfo - 获取系统信息"""
+        await naga_handler.finish(help_text)
     
     # 检查是否是配置命令
     if user_message.startswith("activate "):
@@ -134,10 +367,12 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
         else:
             await naga_handler.finish("❌ 请提供有效的前缀")
     
-    # 检查API服务器是否在线
-    is_api_healthy = await naga_client.health_check()
-    logger.debug(f"API健康检查结果: {is_api_healthy}")
-    if not is_api_healthy:
+    # 检查API服务器是否在线（首次使用时执行健康检查）
+    if api_healthy is None:
+        # 首次使用时执行健康检查
+        await check_api_health()
+    
+    if not api_healthy:
         logger.error("NagaAgent API服务器未响应，请检查服务器是否启动")
         await naga_handler.finish("NagaAgent API服务器未响应，请检查服务器是否启动")
     
@@ -178,11 +413,78 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
             info_text += f"  {key}: {value}\n"
         await naga_handler.finish(info_text.rstrip())
     
+    # 会话管理命令
+    elif user_message.startswith("session "):
+        await handle_session_commands(user_id, user_message[8:], naga_handler)  # 8是"session "的长度
+        return
+    
     # 处理普通对话
     try:
         logger.info(f"开始处理普通对话请求: {user_message}")
+        
+        # 获取用户的会话ID（如果存在）
+        # 如果用户没有任何会话，自动创建一个默认会话
+        if user_id not in user_sessions:
+            user_sessions[user_id] = {}
+        
+        user_session_dict = user_sessions.get(user_id, {})
+        active_session_name = active_sessions.get(user_id)
+        
+        # 初始化session_id变量
+        session_id = None
+        
+        # 如果没有任何会话，自动创建默认会话
+        if not user_session_dict:
+            # 创建默认会话，使用生成的6位数字ID
+            default_session_id = generate_session_id()
+            user_session_dict["default"] = default_session_id
+            user_sessions[user_id] = user_session_dict
+            active_sessions[user_id] = "default"
+            active_session_name = "default"
+            session_id = default_session_id
+            logger.debug(f"为用户 {user_id} 自动创建默认会话，ID: {default_session_id}")
+        # 如果没有活跃会话但有会话存在，使用第一个会话
+        elif not active_session_name and user_session_dict:
+            active_session_name = next(iter(user_session_dict))
+            active_sessions[user_id] = active_session_name
+            # 确保会话有有效的ID
+            session_id = user_session_dict.get(active_session_name)
+            if not session_id:
+                session_id = generate_session_id()
+                user_session_dict[active_session_name] = session_id
+                user_sessions[user_id] = user_session_dict
+                logger.debug(f"为用户 {user_id} 的会话 '{active_session_name}' 分配ID: {session_id}")
+        else:
+            # 如果有活跃会话，获取会话ID
+            if active_session_name:
+                session_id = user_session_dict.get(active_session_name)
+                # 如果会话ID不存在或无效，生成新的ID
+                if not session_id:
+                    session_id = generate_session_id()
+                    user_session_dict[active_session_name] = session_id
+                    user_sessions[user_id] = user_session_dict
+                    logger.debug(f"为用户 {user_id} 的会话 '{active_session_name}' 分配ID: {session_id}")
+        
+        # 确保session_id不为None
+        if not session_id:
+            session_id = generate_session_id()
+            # 如果有活跃会话，则更新该会话的ID
+            if active_session_name:
+                user_session_dict[active_session_name] = session_id
+                user_sessions[user_id] = user_session_dict
+                logger.debug(f"为用户 {user_id} 的会话 '{active_session_name}' 更新ID: {session_id}")
+            else:
+                # 如果没有活跃会话，创建默认会话
+                user_session_dict["default"] = session_id
+                user_sessions[user_id] = user_session_dict
+                active_sessions[user_id] = "default"
+                active_session_name = "default"
+                logger.debug(f"为用户 {user_id} 创建默认会话，ID: {session_id}")
+        
+        logger.debug(f"用户 {user_id} 的活跃会话 '{active_session_name}' ID: {session_id}")
+        
         # 先尝试普通对话
-        response = await naga_client.chat(user_message)
+        response = await naga_client.chat(user_message, session_id)
         logger.debug(f"API响应: {response}")
         
         # 检查响应格式
@@ -198,7 +500,28 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
             
         if response.get("status") == "success":
             reply = response.get("response", "")
-            session_id = response.get("session_id")
+            new_session_id = response.get("session_id")
+            
+            # 保存用户的会话ID以供后续对话使用
+            # 如果API没有返回新的会话ID，使用我们生成的ID
+            actual_session_id = new_session_id if new_session_id else session_id
+            
+            if actual_session_id:
+                # 初始化用户会话字典
+                if user_id not in user_sessions:
+                    user_sessions[user_id] = {}
+                
+                # 获取当前活跃会话名
+                active_session_name = active_sessions.get(user_id)
+                
+                # 如果有活跃会话，保存会话ID
+                if active_session_name:
+                    user_sessions[user_id][active_session_name] = actual_session_id
+                    logger.debug(f"为用户 {user_id} 的会话 '{active_session_name}' 保存ID: {actual_session_id}")
+                    
+                    # 更新当前会话ID变量，确保在后续工具调用中使用正确的会话ID
+                    session_id = actual_session_id
+                
             logger.info(f"API调用成功，回复长度: {len(reply) if reply else 0}, session_id: {session_id}")
             
             # 检查回复是否为空
@@ -206,17 +529,24 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
                 logger.warning("API返回了空回复")
                 await naga_handler.finish("API返回了空回复")
             
-            # 检查是否有HANDOFF内容需要处理
+            # 检查是否有HANDOFF内容需要处理（工具调用）
             handoff_data = parse_handoff_content(reply)
             if handoff_data:
-                logger.info(f"检测到HANDOFF内容，开始处理工具调用循环: {handoff_data['service_name']}")
+                logger.info(f"检测到工具调用，开始处理工具调用循环: {handoff_data['service_name']}")
+                # 确保session_id已定义
+                if 'session_id' not in locals():
+                    logger.warning("在工具调用循环中，session_id未定义，使用默认值")
+                    session_id = None
+                
                 # 处理工具调用循环
                 for i in range(plugin_config.max_handoff_loop):
                     logger.info(f"执行第 {i+1} 次工具调用: {handoff_data['service_name']}")
                     # 执行MCP服务调用
+                    # 根据新的API文档，task应该包含tool_name和其他参数
+                    task_data = handoff_data["params"].copy()
                     service_result = await naga_client.mcp_handoff(
                         handoff_data["service_name"],
-                        {"action": "execute", "params": handoff_data["params"]},
+                        task_data,
                         session_id
                     )
                     logger.debug(f"工具调用结果: {service_result}")
@@ -235,6 +565,10 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
                     # 将结果发送回LLM进行下一步处理
                     followup_message = f"工具 {handoff_data['service_name']} 执行结果: {json.dumps(service_result, ensure_ascii=False)}"
                     logger.debug(f"发送给LLM的消息: {followup_message}")
+                    # 确保session_id在调用前已定义
+                    if 'session_id' not in locals() or session_id is None:
+                        logger.warning("在工具调用循环中，session_id未定义，使用默认值")
+                        session_id = None
                     followup_response = await naga_client.chat(
                         followup_message,
                         session_id
@@ -253,9 +587,30 @@ async def handle_naga_command(bot: Bot, event: Event, state: T_State):
                         await naga_handler.finish(f"LLM调用失败: {error_msg}")
                         
                     reply = followup_response.get("response", "")
+                    # 更新会话ID（如果API返回了新的会话ID）
+                    new_session_id = followup_response.get("session_id")
+                    # 如果API没有返回新的会话ID，使用我们生成的ID
+                    actual_session_id = new_session_id if new_session_id else session_id
+                    
+                    if actual_session_id:
+                        # 初始化用户会话字典
+                        if user_id not in user_sessions:
+                            user_sessions[user_id] = {}
+                        
+                        # 获取当前活跃会话名
+                        active_session_name = active_sessions.get(user_id)
+                        
+                        # 如果有活跃会话，保存会话ID
+                        if active_session_name:
+                            user_sessions[user_id][active_session_name] = actual_session_id
+                            logger.debug(f"为用户 {user_id} 的会话 '{active_session_name}' 更新ID: {actual_session_id}")
+                            
+                            # 更新当前会话ID变量
+                            session_id = actual_session_id
+                    
                     handoff_data = parse_handoff_content(reply)
                     
-                    # 如果没有更多的HANDOFF内容，跳出循环
+                    # 如果没有更多的工具调用内容，跳出循环
                     if not handoff_data:
                         logger.info("工具调用循环结束")
                         break

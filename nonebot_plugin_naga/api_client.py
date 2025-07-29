@@ -11,16 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 class NagaAgentClient:
-    """NagaAgent API 客户端"""
+    """NagaAgent API 客户端，用于与NagaAgent服务进行交互"""
     
     def __init__(self):
         """初始化客户端"""
         self.base_url = f"http://{plugin_config.naga_api_host}:{plugin_config.naga_api_port}"
-        self.client = httpx.AsyncClient()
+        # 设置较长的超时时间以支持长响应
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
     
     async def health_check(self) -> bool:
         """
-        健康检查
+        健康检查，验证NagaAgent服务是否正常运行
         
         Returns:
             bool: 服务器是否健康
@@ -37,14 +38,14 @@ class NagaAgentClient:
     
     async def chat(self, message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        普通对话接口
+        普通对话接口，向NagaAgent发送用户消息并获取回复
         
         Args:
             message: 用户消息
             session_id: 会话ID（可选）
             
         Returns:
-            API响应结果
+            API响应结果，包含status、response和session_id字段
         """
         url = f"{self.base_url}/chat"
         data = {
@@ -81,14 +82,14 @@ class NagaAgentClient:
     
     async def chat_stream(self, message: str, session_id: Optional[str] = None) -> AsyncGenerator[str, None]:
         """
-        流式对话接口
+        流式对话接口，向NagaAgent发送用户消息并以流式方式获取回复
         
         Args:
             message: 用户消息
             session_id: 会话ID（可选）
             
         Yields:
-            流式响应数据
+            流式响应数据，每个数据块为一行JSON格式的内容
         """
         url = f"{self.base_url}/chat/stream"
         data = {
@@ -113,11 +114,11 @@ class NagaAgentClient:
     
     async def mcp_handoff(self, service_name: str, task: Dict[str, Any], session_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        MCP服务调用接口
+        MCP服务调用接口，执行指定的MCP服务任务
         
         Args:
             service_name: 服务名称
-            task: 任务信息
+            task: 任务信息，包含tool_name和其他参数
             session_id: 会话ID（可选）
             
         Returns:
@@ -206,7 +207,7 @@ class NagaAgentClient:
         获取系统信息
         
         Returns:
-            系统信息
+            系统信息，包含版本、状态等信息
         """
         url = f"{self.base_url}/system/info"
         try:
